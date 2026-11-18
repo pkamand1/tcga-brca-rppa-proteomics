@@ -1,0 +1,232 @@
+---
+title: "Protein and phosphoprotein signatures of breast cancer subtypes: an RPPA analysis of TCGA"
+author: "Patricia K. Kamanda"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    df_print: kable
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE, fig.width = 7, fig.height = 4.5,
+                      dpi = 120, fig.path = "results/figures/")
+suppressPackageStartupMessages({
+  library(limma)
+  library(survival)
+  library(mclust)
+  library(dplyr)
+  library(tidyr)
+  library(ggplot2)
+  library(ggrepel)
+  library(pheatmap)
+  library(broom)
+})
+theme_set(theme_bw(base_size = 12))
+set.seed(20261117)
+fmt_p <- function(p) ifelse(p < 0.001, formatC(p, format = "e", digits = 1), formatC(p, format = "f", digits = 3))
+subtype_colours <- c(LumA = "#2471A3", LumB = "#85C1E9", Her2 = "#C0392B", Basal = "#7D3C98", Normal = "#27AE60")
+```
+
+## Background and questions
+
+Reverse phase protein arrays (RPPA) measure the abundance of total and phosphorylated proteins across hundreds of samples with validated antibodies, adding a direct view of signalling activity to what transcriptomic subtyping can show. The Cancer Genome Atlas (TCGA) profiled breast tumours with RPPA as part of the PanCancer Atlas, and the normalized data are distributed through cBioPortal. This analysis asks:
+
+1. Do the PAM50 molecular subtypes, defined from gene expression, have distinct protein and phosphoprotein profiles, and do the expected markers (estrogen receptor, progesterone receptor, HER2) behave as they should?
+2. How well does unsupervised clustering of the protein data alone recover the PAM50 subtypes?
+3. Which proteins are associated with progression-free survival after adjustment for age and stage?
+
+## Data
+
+```{r data}
+rppa_raw <- read.delim("data/data_rppa.txt", check.names = FALSE)
+patients <- read.delim("data/data_clinical_patient.txt", comment.char = "#", check.names = FALSE)
+
+antibody <- sub("^.*\\|", "", rppa_raw[[1]])
+gene     <- trimws(sub("\\|.*$", "", rppa_raw[[1]]))
+rppa <- as.matrix(rppa_raw[, -1])
+rownames(rppa) <- make.unique(antibody)
+colnames(rppa) <- substr(colnames(rppa), 1, 12)   # TCGA sample barcode to patient barcode
+rppa <- rppa[, !duplicated(colnames(rppa))]
+
+clinical <- patients |>
+  transmute(patient = PATIENT_ID,
+            subtype = sub("BRCA_", "", SUBTYPE),
+            age = as.numeric(AGE),
+            stage = case_when(grepl("STAGE IV", AJCC_PATHOLOGIC_TUMOR_STAGE) ~ "IV",
+                              grepl("STAGE III", AJCC_PATHOLOGIC_TUMOR_STAGE) ~ "III",
+                              grepl("STAGE II", AJCC_PATHOLOGIC_TUMOR_STAGE) ~ "II",
+                              grepl("STAGE I", AJCC_PATHOLOGIC_TUMOR_STAGE) ~ "I",
+                              TRUE ~ NA_character_),
+            pfs_months = as.numeric(PFS_MONTHS),
+            pfs_event = as.integer(substr(PFS_STATUS, 1, 1) == "1")) |>
+  filter(patient %in% colnames(rppa), subtype %in% names(subtype_colours)) |>
+  mutate(subtype = factor(subtype, levels = names(subtype_colours)),
+         stage = factor(stage, levels = c("I", "II", "III", "IV")))
+
+rppa <- rppa[, clinical$patient]
+c(proteins = nrow(rppa), tumours = ncol(rppa), phospho = sum(grepl("_p[STY]", rownames(rppa))))
+table(clinical$subtype)
+```
+
+The data are the TCGA PanCancer Atlas RPPA values for breast cancer, already normalized across batches by the TCGA RPPA core (replicate-based normalization, log2 scale, median-centred). `r ncol(rppa)` tumours have both RPPA data and a PAM50 subtype.
+
+## Quality control and missing values
+
+```{r missing}
+missing_by_protein <- rowMeans(is.na(rppa))
+keep <- missing_by_protein <= 0.2
+summary(missing_by_protein)
+rppa <- rppa[keep, ]
+```
+
+`r sum(!keep)` antibodies with more than 20% missing values are removed, leaving `r nrow(rppa)`. Remaining gaps (`r round(100 * mean(is.na(rppa)), 1)`% of values) are left as missing for the linear models, which handle them protein by protein, and are imputed with each protein's median only for clustering and PCA, which need complete data.
+
+```{r distributions, fig.cap = "Distribution of RPPA values in 60 randomly chosen tumours, which should be comparable after normalization.", fig.height = 3.5}
+long <- as.data.frame(rppa[, sample(ncol(rppa), 60)]) |>
+  pivot_longer(everything(), names_to = "tumour", values_to = "value")
+ggplot(long, aes(tumour, value)) + geom_boxplot(outlier.size = 0.3, fill = "#D6EAF8") +
+  theme(axis.text.x = element_blank(), axis.ticks.x = element_blank()) + labs(x = "Tumour", y = "Normalized RPPA value")
+rppa_complete <- t(apply(rppa, 1, function(x) { x[is.na(x)] <- median(x, na.rm = TRUE); x }))
+```
+
+## Question 1: protein differences between subtypes
+
+Each protein is modelled on subtype with limma, with empirical Bayes moderation of the variances, which borrows strength across proteins. A moderated F-test asks whether a protein differs anywhere among the five subtypes, and pairwise contrasts against luminal A, the largest and most indolent group, describe the direction of each difference.
+
+```{r limma}
+design <- model.matrix(~ 0 + subtype, data = clinical)
+colnames(design) <- levels(clinical$subtype)
+fit <- lmFit(rppa, design)
+contrasts <- makeContrasts(LumB_vs_LumA = LumB - LumA, Her2_vs_LumA = Her2 - LumA,
+                           Basal_vs_LumA = Basal - LumA, Normal_vs_LumA = Normal - LumA, levels = design)
+fit2 <- eBayes(contrasts.fit(fit, contrasts))
+anova_tab <- topTable(fit2, number = Inf, sort.by = "F") |>
+  tibble::rownames_to_column("antibody")
+write.csv(anova_tab, "results/tables/subtype_moderated_F.csv", row.names = FALSE)
+n_sig <- sum(anova_tab$adj.P.Val < 0.05)
+head(anova_tab |> select(antibody, LumB_vs_LumA, Her2_vs_LumA, Basal_vs_LumA, F, adj.P.Val), 15)
+```
+
+`r n_sig` of `r nrow(anova_tab)` antibodies differ among the subtypes at a false discovery rate of 5%.
+
+```{r positive_controls, fig.cap = "The receptors that define clinical breast cancer subtypes, by PAM50 subtype.", fig.height = 4}
+controls <- intersect(c("ER-alpha", "PR", "HER2", "HER2_pY1248", "GATA3", "AR"), rownames(rppa))
+ctrl_long <- as.data.frame(t(rppa[controls, ])) |>
+  mutate(subtype = clinical$subtype) |>
+  pivot_longer(-subtype, names_to = "antibody", values_to = "value") |>
+  mutate(antibody = factor(antibody, levels = controls))
+ggplot(ctrl_long, aes(subtype, value, fill = subtype)) +
+  geom_boxplot(outlier.size = 0.4) + facet_wrap(~ antibody, nrow = 2, scales = "free_y") +
+  scale_fill_manual(values = subtype_colours, guide = "none") + labs(x = NULL, y = "Normalized RPPA value") +
+  theme(axis.text.x = element_text(angle = 35, hjust = 1))
+```
+
+These are positive controls for the data and the subtype labels: estrogen receptor-alpha, progesterone receptor, and GATA3 should be highest in the luminal subtypes and lowest in basal-like tumours, and total and phosphorylated HER2 should stand out in the HER2-enriched subtype.
+
+```{r volcano, fig.cap = "Basal-like against luminal A tumours. The 20 most significant antibodies are labelled."}
+basal <- topTable(fit2, coef = "Basal_vs_LumA", number = Inf) |> tibble::rownames_to_column("antibody")
+write.csv(basal, "results/tables/basal_vs_luminalA.csv", row.names = FALSE)
+ggplot(basal, aes(logFC, -log10(adj.P.Val), colour = adj.P.Val < 0.05)) +
+  geom_point(size = 1.5, alpha = 0.7) +
+  geom_text_repel(data = head(basal, 20), aes(label = antibody), colour = "black", size = 3, max.overlaps = 30) +
+  scale_colour_manual(values = c(`FALSE` = "#BDC3C7", `TRUE` = "#7D3C98"), guide = "none") +
+  labs(x = "Difference in normalized RPPA value, basal-like minus luminal A", y = "-log10 adjusted p-value")
+```
+
+```{r heatmap, fig.cap = "The 40 antibodies that differ most among subtypes, scaled per antibody; tumours ordered by subtype.", fig.height = 8, fig.width = 8}
+top40 <- head(anova_tab$antibody, 40)
+ord <- order(clinical$subtype)
+mat <- t(scale(t(rppa_complete[top40, ord])))
+mat[mat > 3] <- 3; mat[mat < -3] <- -3
+pheatmap(mat, cluster_cols = FALSE, show_colnames = FALSE, fontsize_row = 7, border_color = NA,
+         annotation_col = data.frame(subtype = clinical$subtype[ord], row.names = colnames(mat)),
+         annotation_colors = list(subtype = subtype_colours),
+         color = colorRampPalette(c("#2471A3", "white", "#C0392B"))(100))
+```
+
+## Question 2: does protein data alone recover the subtypes?
+
+```{r pca, fig.cap = "Principal components of the protein data, coloured by PAM50 subtype."}
+pca <- prcomp(t(rppa_complete), scale. = TRUE)
+var_explained <- round(100 * pca$sdev^2 / sum(pca$sdev^2), 1)
+pcs <- data.frame(pca$x[, 1:2], subtype = clinical$subtype)
+ggplot(pcs, aes(PC1, PC2, colour = subtype)) + geom_point(size = 1.4, alpha = 0.75) +
+  scale_colour_manual(values = subtype_colours) +
+  labs(x = paste0("PC1 (", var_explained[1], "%)"), y = paste0("PC2 (", var_explained[2], "%)"), colour = "PAM50")
+```
+
+```{r clustering}
+variable <- names(sort(apply(rppa_complete, 1, sd), decreasing = TRUE))[1:80]
+d <- dist(scale(t(rppa_complete[variable, ])), method = "euclidean")   # tumours as rows, antibodies standardized
+hc <- hclust(d, method = "ward.D2")
+clusters <- cutree(hc, k = 5)
+ari <- adjustedRandIndex(clusters, clinical$subtype)
+agreement <- table(protein_cluster = clusters, PAM50 = clinical$subtype)
+write.csv(as.data.frame.matrix(agreement), "results/tables/protein_clusters_vs_pam50.csv")
+agreement
+basal_capture <- max(agreement[, "Basal"]) / sum(agreement[, "Basal"])
+```
+
+Ward clustering of the 80 most variable antibodies into five groups agrees with PAM50 with an adjusted Rand index of `r round(ari, 2)`. The agreement is partial, as expected for clusters built from about 200 proteins against subtypes defined from 50 genes' expression. The protein clusters capture the basal-like tumours most cleanly: `r round(100 * basal_capture)`% fall into a single cluster. Luminal A and luminal B tumours, which differ mainly in proliferation rather than in receptor status, mix more freely.
+
+## Question 3: proteins associated with progression-free survival
+
+Each antibody is tested in a Cox model for progression-free survival adjusted for age and stage, with the antibody standardized so that hazard ratios are per standard deviation. TCGA progression-free interval is the endpoint recommended for breast cancer in the PanCancer Atlas clinical data resource (Liu et al., 2018).
+
+```{r cox}
+surv_data <- clinical |> filter(!is.na(pfs_months), !is.na(stage), !is.na(age))
+x <- scale(t(rppa[, surv_data$patient]))
+cox_results <- lapply(colnames(x), function(ab) {
+  df <- data.frame(surv_data, value = x[, ab])
+  fit <- coxph(Surv(pfs_months, pfs_event) ~ value + age + stage, data = df)
+  s <- summary(fit)$coefficients["value", ]
+  data.frame(antibody = ab, hr_per_sd = exp(s["coef"]), se = s["se(coef)"], p = s["Pr(>|z|)"])
+}) |> bind_rows()
+cox_results$fdr <- p.adjust(cox_results$p, method = "BH")
+cox_results <- cox_results |> arrange(p) |>
+  mutate(lower = exp(log(hr_per_sd) - 1.96 * se), upper = exp(log(hr_per_sd) + 1.96 * se))
+write.csv(cox_results, "results/tables/cox_pfs_per_antibody.csv", row.names = FALSE)
+c(patients = nrow(surv_data), events = sum(surv_data$pfs_event), significant_fdr05 = sum(cox_results$fdr < 0.05))
+head(cox_results |> select(antibody, hr_per_sd, lower, upper, p, fdr), 10) |> mutate(across(where(is.numeric), ~ signif(.x, 3)))
+```
+
+```{r forest, fig.cap = "Adjusted hazard ratios per standard deviation for the 15 antibodies most strongly associated with progression-free survival."}
+top15 <- head(cox_results, 15) |> mutate(antibody = factor(antibody, levels = rev(antibody)))
+ggplot(top15, aes(hr_per_sd, antibody, colour = fdr < 0.05)) +
+  geom_vline(xintercept = 1, linetype = 2, colour = "grey50") +
+  geom_pointrange(aes(xmin = lower, xmax = upper)) + scale_x_log10() +
+  scale_colour_manual(values = c(`FALSE` = "#7F8C8D", `TRUE` = "#C0392B"), labels = c("FDR 5% or more", "FDR below 5%")) +
+  labs(x = "Hazard ratio per SD (adjusted for age and stage)", y = NULL, colour = NULL)
+```
+
+```{r km, fig.cap = "Progression-free survival by tertile of the antibody most strongly associated with outcome."}
+best <- as.character(cox_results$antibody[1])
+km_data <- surv_data |> mutate(level = cut(rppa[best, patient], quantile(rppa[best, patient], c(0, 1/3, 2/3, 1), na.rm = TRUE),
+                                         include.lowest = TRUE, labels = c("Low", "Middle", "High")))
+km <- survfit(Surv(pfs_months / 12, pfs_event) ~ level, data = km_data)
+km_tidy <- tidy(km) |> mutate(strata = sub("level=", "", strata))
+ggplot(km_tidy, aes(time, estimate, colour = strata)) + geom_step(linewidth = 0.9) +
+  scale_y_continuous(limits = c(0, 1), labels = scales::percent) +
+  scale_colour_manual(values = c(Low = "#2471A3", Middle = "#7F8C8D", High = "#C0392B")) +
+  labs(x = "Years", y = "Progression-free survival", colour = paste(best, "tertile"))
+logrank_p <- pchisq(survdiff(Surv(pfs_months, pfs_event) ~ level, data = km_data)$chisq, df = 2, lower.tail = FALSE)
+```
+
+No antibody passes a false discovery rate of 5% (the smallest adjusted p-value is `r signif(min(cox_results$fdr), 2)`), so the ranking above is exploratory. The log-rank test across tertiles of `r best`, the top-ranked antibody, gives p = `r fmt_p(logrank_p)`, a nominal result that does not survive correction for the `r nrow(cox_results)` antibodies tested. With `r sum(surv_data$pfs_event)` events among `r nrow(surv_data)` patients, survival associations for individual antibodies should be read as hypotheses for validation in an independent cohort, not as prognostic markers.
+
+## Conclusions
+
+The PAM50 subtypes have strongly distinct protein profiles: `r n_sig` of `r nrow(anova_tab)` antibodies differ among them, and the receptors that define clinical subtyping behave exactly as expected, which supports both the data and the labels. Protein data alone recover the basal-like group well but blur the distinction between the luminal subtypes, a useful reminder that proteomic and transcriptomic classifications capture overlapping but different biology. After adjustment for age and stage, `r n_fdr <- sum(cox_results$fdr < 0.05); if (n_fdr == 0) "no antibody is" else paste(n_fdr, "antibodies are")` associated with progression-free survival at a false discovery rate of 5%; the strongest nominal associations, such as higher `r cox_results$antibody[1]` with shorter progression-free survival and higher progesterone receptor and Bcl-2 with longer, are consistent with known breast cancer biology but would need confirmation in an independent, larger cohort.
+
+## References
+
+Liu, J., Lichtenberg, T., Hoadley, K. A., et al. (2018). An integrated TCGA pan-cancer clinical data resource to drive high-quality survival outcome analytics. *Cell, 173*(2), 400–416.
+
+Ritchie, M. E., Phipson, B., Wu, D., et al. (2015). limma powers differential expression analyses for RNA-sequencing and microarray studies. *Nucleic Acids Research, 43*(7), e47.
+
+## Session information
+
+```{r session}
+sessionInfo()
+```

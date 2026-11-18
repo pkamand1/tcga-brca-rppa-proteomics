@@ -1,0 +1,4 @@
+.Rhistory
+.RData
+*.log
+analysis_files/
